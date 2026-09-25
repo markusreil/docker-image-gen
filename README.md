@@ -145,10 +145,12 @@ The project is structured for it:
 - Config changes to the bridge data dir do not apply to an existing
   `bridge-data` volume; remove service + volume to reseed (see
   [`openai-bridge/README.md`](openai-bridge/README.md)).
-- The bridge's `sdxl-txt2img.json` workflow and `registry.json` are rendered at
-  build time from the tracked templates in `openai-bridge/templates/` using the
-  `SDXL_MODEL_*` build args, then seeded into `bridge-data` on first start only.
-  Changing the model reference requires a rebuild and a reseed — see
+- The bridge's `sdxl-txt2img.json` workflow and `registry.json` are plain JSON
+  templates tracked in `openai-bridge/templates/` and baked into the image. On
+  first start they are seeded into `bridge-data`, and the bridge auto-discovers
+  the SDXL model reference from InvokeAI (`/api/v2/models/`, `base=sdxl`,
+  `type=main`) — no build args, no manual model config. Discovery runs once and
+  is never refreshed; `BRIDGE_MODEL_WAIT_SECONDS` caps the first-run wait — see
   [Workflow templates](openai-bridge/README.md#workflow-templates).
 - Stamp builds with a date if you want a traceable image:
   `BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) docker compose build`.
@@ -198,6 +200,11 @@ with open("fox.png", "wb") as f:
 The bridge returns `b64_json` only (any other `response_format` is rejected),
 and `model` must match a registry id configured in `/admin` — not an InvokeAI
 checkpoint name.
+
+See [Using the bridge from an agent](openai-bridge/README.md#using-the-bridge-from-an-agent)
+for the full contract plus the zero-dependency helper script
+(`openai-bridge/examples/generate-image.sh`) and drop-in opencode /
+oh-my-opencode-slim examples.
 
 ## Security notes
 

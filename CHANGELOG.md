@@ -9,14 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Tracked bridge workflow/registry templates under `openai-bridge/templates/`
-  (`workflows/sdxl-txt2img.json.tmpl`, `registry.json.tmpl`), rendered at image
-  build time with `envsubst` restricted to the `SDXL_MODEL_*` build args, so the
-  seeded workflow and registry are reproducible from source instead of
-  hand-written into the `bridge-data` volume.
-- `SDXL_MODEL_KEY` / `SDXL_MODEL_NAME` / `SDXL_MODEL_HASH` / `SDXL_MODEL_BASE`
-  compose build args (optional, wired from `.env` / `env.example`) and first-run
-  seeding of `workflows/*` plus `registry.json` from the rendered templates.
+- Agent integration examples under `openai-bridge/examples/`: the
+  `generate-image.sh` helper, an opencode custom command plus an OpenAI-Images
+  MCP fragment, and an oh-my-opencode-slim `image-generation` skill plus config
+  example.
+- `openai-bridge/README.md` "Using the bridge from an agent" section documenting
+  the `/v1` contract, the helper script, and the opencode /
+  oh-my-opencode-slim integration paths.
+- Tracked bridge workflow/registry templates as plain JSON under
+  `openai-bridge/templates/` (`workflows/sdxl-txt2img.json`, `registry.json`),
+  baked into the image and seeded into `bridge-data` on first start instead of
+  being hand-written into the volume.
+- First-run startup discovery of the SDXL model reference: the entrypoint
+  queries InvokeAI (`/api/v2/models/`, matching `base` + `type=main`) and
+  patches the workflow with `jq`, bounded by the optional
+  `BRIDGE_MODEL_WAIT_SECONDS`.
 - `docker-compose.yml` defining `local-image-ai` with `invokeai-nvidia`
   (`nvidia` profile) and `invokeai-amd` (`amd` profile) sharing a common
   `x-invokeai-common` anchor, plus the always-on `openai-bridge`.
@@ -35,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The `openai-bridge` workflow templates switched from build-time `envsubst`
+  substitution (via model-reference build args) to startup discovery: plain JSON
+  templates are baked into the image and the model reference is resolved from
+  InvokeAI during first-run seeding only. No build args or model values in
+  `.env` are needed, and the runtime image now ships `jq`.
 - The `openai-bridge` entrypoint now seeds `workflows/*` (not just
   `registry.json`) on first start and chowns the data dir recursively; the data
   dir is small config, so the chown is cheap and seeded files stay writable by

@@ -57,18 +57,23 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 
 ## openai-bridge entrypoint and templates
 
-- Workflow/registry templates are tracked in `openai-bridge/templates/` and
-  rendered at **build time** via `envsubst` limited to the `SDXL_MODEL_*` build
-  args; the rendered files land in the image at
-  `/usr/local/share/openai-bridge/templates`. Never add hand-edited workflow
-  JSON to the `bridge-data` volume as the source of truth.
+- Workflow/registry templates are tracked as plain JSON in
+  `openai-bridge/templates/` and baked into the image at
+  `/usr/local/share/openai-bridge/templates` (no build args, no `envsubst`).
+  Never add hand-edited workflow JSON to the `bridge-data` volume as the source
+  of truth.
+- On **first start only** the entrypoint copies `workflows/*` and
+  `registry.json` into the data dir and, if a workflow's model ref is empty,
+  resolves it from InvokeAI (`/api/v2/models/`, matching `base` + `type=main`)
+  after a readiness poll bounded by `BRIDGE_MODEL_WAIT_SECONDS`. Existing
+  volumes are never re-resolved or overwritten and discovery is not periodic;
+  the runtime image ships `jq` for this.
 - The entrypoint runs as root, recreates the `bridge` user/group to match
-  `PUID`/`PGID`, seeds `workflows/*` and `registry.json` **only on first start**
-  (`if [ ! -f ... ]`), chowns the data dir **recursively** (small config), then
+  `PUID`/`PGID`, chowns the data dir **recursively** (small config), then
   `exec su-exec "$PUID:$PGID" ... --no-browser`. No `config.toml` is seeded —
   all config comes from `PROXY_*` env vars.
-- Changing the model reference means rebuild **and** reseed (write-once
-  seeding); keep the reseed procedure in `openai-bridge/README.md` current.
+- Changing models means a reseed (write-once seeding); keep the reseed
+  procedure in `openai-bridge/README.md` current.
 
 ## Changelog
 

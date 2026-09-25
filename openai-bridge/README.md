@@ -25,21 +25,16 @@ cd /src && CGO_ENABLED=0 GOBIN=/out go install ./cmd/proxy
 ```
 
 The resulting binary is named `proxy`; it is renamed to `invoke-openai-proxy`
-so the entrypoint path is explicit. The build also renders the tracked workflow
-templates (see [Workflow templates](#workflow-templates)) and uses a pinned
-`golang:${GO_VERSION}-alpine` builder; the runtime is a minimal
-`alpine:3.22` image (`su-exec` + `ca-certificates`) that receives only the
-static binary and the rendered templates.
+so the entrypoint path is explicit. The build uses a pinned
+`golang:${GO_VERSION}-alpine` builder; the runtime is a minimal `alpine:3.22`
+image (`su-exec` + `ca-certificates` + `jq`) that receives the static binary and
+the plain-JSON workflow templates (see
+[Workflow templates](#workflow-templates)).
 
-Build directly if needed (the `SDXL_MODEL_*` args default to placeholders if
-omitted — see [Workflow templates](#workflow-templates)):
+Build directly if needed:
 
 ```sh
-docker build \
-  --build-arg BRIDGE_VERSION=v1.6 \
-  --build-arg SDXL_MODEL_KEY=<key> \
-  --build-arg SDXL_MODEL_NAME="<name>" \
-  --build-arg SDXL_MODEL_HASH=<hash> \
+docker build --build-arg BRIDGE_VERSION=v1.6 \
   -t local-image-ai/openai-bridge:v1.6 .
 ```
 
@@ -61,6 +56,7 @@ and there is nothing to keep in sync.
 | `PROXY_ADMIN_PASS` | empty | Admin Basic-auth password. |
 | `PROXY_TIMEOUT` | `300s` | Upstream request timeout (Go duration). |
 | `PROXY_LOG_LEVEL` | `info` | Log verbosity. |
+| `BRIDGE_MODEL_WAIT_SECONDS` | `180` | Cap (seconds) on the first-run wait for InvokeAI model discovery. |
 
 `PUID` / `PGID` (default `1000:1000`) control the unprivileged user the proxy
 runs as. The `--no-browser` flag is always passed by the entrypoint; it has no
@@ -86,14 +82,76 @@ environment equivalent (the container has no browser).
 - Administratively, InvokeAI itself must stay single-user/private — the bridge
   does not add multi-tenant isolation.
 
+## Using the bridge from an agent
+
+The bridge is a drop-in OpenAI Images endpoint for agents. The contract:
+
+- **Base URL** — `https://images.<domain>/v1` (public) or
+  `http://openai-bridge:8080/v1` on the compose `internal` network.
+- **Auth** — `Authorization: Bearer <BRIDGE_API_KEY>` on every `/v1/*` request.
+- **Models** — `GET /v1/models` lists registry ids. The `model` field in a
+  request is a **registry id** (e.g. `sdxl`), not an InvokeAI checkpoint name.
+- **Generate** — `POST /v1/images/generations` with
+  `{model, prompt, size, n, response_format: "b64_json"[, negative_prompt]}`.
+  Responses are **base64 only** (`.data[0].b64_json`); there is no `url`.
+- **Sizes** — `1024x1024`, `1792x1024`, `1024x1792`.
+- **Generation only** — the bridge exposes `/v1/images/edits` and
+  `/v1/images/variations`, but the bundled `sdxl` entry defines no
+  `edit_workflow` / `variant_workflow`, so those calls are not usable. Use
+  `/v1/images/generations`.
+
+### Zero-dependency helper
+
+[`examples/generate-image.sh`](examples/generate-image.sh) needs only POSIX
+shell, `curl`, `jq` and `base64`:
+
+```sh
+BRIDGE_URL=https://images.example.com/v1 BRIDGE_API_KEY=<token> \
+  openai-bridge/examples/generate-image.sh "a red fox in a snowy forest" 1024x1024 sdxl fox.png
+```
+
+Usage: `generate-image.sh "<prompt>" [size] [model] [outfile]`; defaults are
+`1024x1024`, `sdxl`, `image.png`.
+
+### opencode
+
+- **Custom command** — copy
+  [`examples/opencode/command/image.md`](examples/opencode/command/image.md) to
+  `.opencode/command/image.md` (project) or
+  `~/.config/opencode/command/image.md` (global), then run `/image <prompt>`.
+  It drives the helper script and reports the saved path.
+- **Optional MCP route** — merge
+  [`examples/opencode/opencode.mcp.example.json`](examples/opencode/opencode.mcp.example.json)
+  into your `opencode.json`. This requires a separate MCP server that speaks the
+  OpenAI Images API (the fragment sets `OPENAI_BASE_URL` / `OPENAI_API_KEY` with
+  `{env:BRIDGE_API_KEY}` interpolation); the zero-dependency path is the helper
+  script above.
+
+Config changes require an opencode restart.
+
+### oh-my-opencode-slim
+
+- **Skill** — copy
+  [`examples/oh-my-opencode-slim/skills/image-generation/SKILL.md`](examples/oh-my-opencode-slim/skills/image-generation/SKILL.md)
+  to `~/.config/opencode/skills/image-generation/SKILL.md`.
+- **Grant it** — the skill is enabled through the active preset's `skills`
+  list in `~/.config/opencode/oh-my-opencode-slim.json[c]`: `["*"]` already
+  includes it; an explicit list must add `"image-generation"`.
+- **Optional custom agent** — see
+  [`examples/oh-my-opencode-slim/oh-my-opencode-slim.example.jsonc`](examples/oh-my-opencode-slim/oh-my-opencode-slim.example.jsonc)
+  for the preset skill grants plus a custom `imagegen` agent.
+
+Config changes require an opencode restart.
+
 ## Data directory and model registry
 
 `PROXY_DATA_DIR` (`/data`, backed by the `bridge-data` named volume) holds:
 
 - `registry.json` — the model registry. Seeded once on first start from the
-  rendered `registry.json` template.
+  baked-in `registry.json`.
 - `workflows/` — workflow JSON files, seeded once on first start from the
-  rendered workflow templates.
+  baked-in templates; the model reference is resolved from InvokeAI at that
+  time.
 - `config.toml` — optional; normally absent because env vars take precedence.
 
 Models are registered through the **`/admin` Quick Setup** flow, which writes
@@ -103,53 +161,38 @@ registry id. This project ships a ready-made `sdxl` registry entry plus its
 
 ## Workflow templates
 
-Templates are tracked in the repo under `templates/` and **rendered at image
-build time**, so what ends up in the container is reproducible from source
-(no more hand-written files inside the `bridge-data` volume).
+Templates are tracked in the repo as **plain JSON** under `templates/` and are
+baked into the image at `/usr/local/share/openai-bridge/templates`:
 
-- `templates/workflows/sdxl-txt2img.json.tmpl` — the workflow graph.
-- `templates/registry.json.tmpl` — the model registry entry.
+- `templates/workflows/sdxl-txt2img.json` — the workflow graph, shipped with an
+  empty model reference (`key`, `name` and `hash` blank; `base: "sdxl"`).
+- `templates/registry.json` — the model registry entry (no model variables).
 
-Rendering uses `envsubst` restricted to exactly four build args, so no other
-`${...}` in the templates is touched:
+On first start the entrypoint copies each workflow into the data dir (only when
+the destination does not exist) and, if its model reference is still empty,
+resolves it from InvokeAI:
 
-| Build arg | Compose variable | Purpose |
-| --- | --- | --- |
-| `SDXL_MODEL_KEY` | `SDXL_MODEL_KEY` | InvokeAI model `key` (UUID) of the SDXL main model. |
-| `SDXL_MODEL_NAME` | `SDXL_MODEL_NAME` | Human-readable model name. |
-| `SDXL_MODEL_HASH` | `SDXL_MODEL_HASH` | InvokeAI model hash (e.g. `blake3:...`). |
-| `SDXL_MODEL_BASE` | `SDXL_MODEL_BASE` | Model base type (default `sdxl`). |
+1. **Readiness wait** (lazy — only when a freshly seeded workflow needs a
+   model): poll `GET ${INVOKE_URL}/api/v1/app/version` every 2s, up to
+   `BRIDGE_MODEL_WAIT_SECONDS` seconds (default `180`).
+2. **Resolve**: `GET ${INVOKE_URL}/api/v2/models/`, then select the first entry
+   whose `base` matches the template's `.nodes.model_loader.model.base`
+   (default `sdxl`) and whose `type` is `main`.
+3. **Patch**: `jq --argjson r "$ref" '.nodes.model_loader.model = ($r + {type:"main"})'`.
 
-The rendered files are baked into the image at
-`/usr/local/share/openai-bridge/templates/{workflows/,registry.json}` and seeded
-into the data dir **on first start only** (the entrypoint never overwrites an
-existing file).
+Discovery happens **once, at startup, during first-run seeding only**. Existing
+data volumes are never re-resolved or overwritten, and there is no periodic
+refresh. The model reference is not a build arg and is not baked into the image.
 
-### How to set the model reference
-
-Get the values from InvokeAI's model API:
-
-```sh
-curl -s http://invokeai:9090/api/v2/models/   # or via the WebUI
-```
-
-Pick the entry with `"base": "sdxl"` and `"type": "main"` and copy its `key`,
-`name`, and `hash` into `.env` (`SDXL_MODEL_KEY`, `SDXL_MODEL_NAME`,
-`SDXL_MODEL_HASH`; leave `SDXL_MODEL_BASE=sdxl`). Then rebuild:
-
-```sh
-docker compose build openai-bridge
-```
-
-Compile-time values are baked into the image, so changing the model reference
-requires a **rebuild** — and because seeding is write-once, it also requires a
-reseed for an existing volume.
+If InvokeAI is not ready within the cap, or no matching model is found, the
+entrypoint prints a `WARN:` to stderr and leaves the empty placeholders in
+place; the container still starts. Generation then fails until a model
+reference is set — either through `/admin` or by reseeding.
 
 ### Seed / reseed procedure
 
-Seeding is first-run only, so an existing volume is never overwritten. To
-re-seed `registry.json` and `workflows/` from the current image (for example
-after changing the model reference):
+Seeding is first-run only. To re-seed `registry.json` and `workflows/` from the
+current image — for example to re-run discovery after installing an SDXL model:
 
 ```sh
 docker compose rm -sf openai-bridge
@@ -157,14 +200,15 @@ docker volume rm local-image-ai_bridge-data
 docker compose up -d openai-bridge
 ```
 
-The entrypoint recreates `registry.json` and `workflows/` from the rendered
-templates on the next start. Editing a workflow or the registry in place in the
-volume is also possible, but such edits are lost on the next reseed.
+The entrypoint copies the templates and re-resolves the model reference on the
+next start. Editing a workflow or the registry in place in the volume is also
+possible, but such edits are lost on the next reseed.
 
 ## Entrypoint / privilege drop
 
 The entrypoint runs as root, recreates the `bridge` user/group to match
 `PUID`/`PGID`, creates the data dir and seeds `workflows/*` and `registry.json`
-on first start only, then chowns the data dir **recursively** (the data dir is
-small config, and the seeded files must be writable by the dropped user), then
+on first start only (resolving the SDXL model reference from InvokeAI once, if
+needed), then chowns the data dir **recursively** (the data dir is small config,
+and the seeded files must be writable by the dropped user), then
 `exec su-exec "$PUID:$PGID" invoke-openai-proxy --no-browser`.

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "images": {
+      "type": "local",
+      "command": ["<path-to-an-mcp-server-that-speaks-the-openai-images-api>"],
+      "environment": {
+        "OPENAI_BASE_URL": "https://images.example.com/v1",
+        "OPENAI_API_KEY": "{env:BRIDGE_API_KEY}"
+      },
+      "enabled": true
+    }
+  }
+}

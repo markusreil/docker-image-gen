@@ -125,12 +125,6 @@ services:
         GO_VERSION: ${BRIDGE_GO_VERSION:-1.26.3}
         BRIDGE_VERSION: ${BRIDGE_VERSION:?}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-        # SDXL model reference baked into the rendered workflow/registry
-        # templates at build time (see openai-bridge/README.md).
-        SDXL_MODEL_KEY: ${SDXL_MODEL_KEY:-REPLACE_WITH_MODEL_KEY}
-        SDXL_MODEL_NAME: ${SDXL_MODEL_NAME:-your-sdxl-model}
-        SDXL_MODEL_HASH: ${SDXL_MODEL_HASH:-REPLACE_WITH_MODEL_HASH}
-        SDXL_MODEL_BASE: ${SDXL_MODEL_BASE:-sdxl}
     image: local-image-ai/openai-bridge:${BRIDGE_VERSION:?}
     restart: unless-stopped
     expose:
@@ -154,6 +148,8 @@ services:
       PROXY_ADMIN_PASS: ${BRIDGE_ADMIN_PASS:?}
       PROXY_TIMEOUT: ${BRIDGE_TIMEOUT:-300s}
       PROXY_LOG_LEVEL: ${BRIDGE_LOG_LEVEL:-info}
+      # Cap (seconds) on the first-run wait for InvokeAI model discovery.
+      BRIDGE_MODEL_WAIT_SECONDS: ${BRIDGE_MODEL_WAIT_SECONDS:-180}
       # Full downstream proxy contract.
       VIRTUAL_HOST: *host-bridge
       VIRTUAL_PORT: "8080"
