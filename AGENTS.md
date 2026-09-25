@@ -40,7 +40,7 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 - Use standard named volumes for stateful data (`invokeai-root`,
   `invokeai-models`, `ai-models`, `bridge-data`); avoid host bind mounts.
 - `restart: unless-stopped` for long-running services; `restart: "no"` only
-  for the one-shot `models-init`.
+  for the one-shot `models-init` / `invokeai-models-init`.
 - Set Homepage labels (`homepage.group/name/icon/href/description`) on
   long-running services; an empty icon/description renders as a blank card.
 
@@ -48,7 +48,10 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 
 - InvokeAI owns its models on the `invokeai-models` volume at `/models`
   (`INVOKEAI_MODELS_DIR=/models`, outside `INVOKEAI_ROOT`). It is the single
-  writer; never point `models_dir` at the ComfyUI-canonical tree.
+  writer; never point `models_dir` at the ComfyUI-canonical tree. The one-shot
+  `invokeai-models-init` chowns the volume top level to `PUID`/`PGID`: the
+  upstream entrypoint only chowns `INVOKEAI_ROOT`, so without it `/models` stays
+  root-owned and startup fails.
 - `ai-models` is ComfyUI's own store. `models-init` creates the
   ComfyUI-canonical layout and chowns **only the top level** (never
   `chown -R`). Keep the directory list and the non-recursive chown in sync.

@@ -27,6 +27,9 @@ x-invokeai-env: &invokeai-env
   INVOKEAI_MODELS_DIR: /models
   INVOKEAI_HOST: 0.0.0.0
   INVOKEAI_PORT: "9090"
+  # UID the image's entrypoint assigns to its runtime user before dropping
+  # privileges. Must match PUID, which owns the model volume.
+  CONTAINER_UID: ${PUID:-1000}
   # Full downstream proxy contract — the proxy variant decides what applies.
   VIRTUAL_HOST: *host-invokeai
   VIRTUAL_PORT: "9090"
@@ -50,6 +53,11 @@ x-invokeai-common: &invokeai-common
       aliases:
         - invokeai
     web-proxy: {}
+  # The upstream entrypoint only chowns INVOKEAI_ROOT (/invokeai) before
+  # dropping to its runtime user, so /models needs an explicit ownership fix.
+  depends_on:
+    invokeai-models-init:
+      condition: service_completed_successfully
   labels:
     homepage.group: AI
     homepage.name: InvokeAI
@@ -78,6 +86,24 @@ services:
         /models/loras /models/vae /models/clip /models/text_encoders
         /models/controlnet /models/upscale_models /models/embeddings &&
         chown ${PUID:-1000}:${PGID:-1000} /models /models/*
+
+  # One-shot ownership fix for InvokeAI's own model volume. The upstream
+  # entrypoint chowns INVOKEAI_ROOT recursively and then drops to its runtime
+  # user, but never touches INVOKEAI_MODELS_DIR (/models), leaving the volume
+  # root-owned and InvokeAI unable to create /models/model_images.
+  # Only the top level is chowned (NON-recursive): the store is large and
+  # InvokeAI creates its subdirectories as the runtime user afterwards.
+  invokeai-models-init:
+    image: alpine:3.22
+    restart: "no"
+    volumes:
+      - invokeai-models:/models
+    networks:
+      - internal
+    entrypoint:
+      - /bin/sh
+      - -c
+      - chown ${PUID:-1000}:${PGID:-1000} /models
 
   invokeai-nvidia:
     <<: *invokeai-common

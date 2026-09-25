@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed InvokeAI failing to start with `PermissionError: [Errno 13] Permission
+  denied: '/models/model_images'`: the upstream entrypoint only chowns
+  `INVOKEAI_ROOT` before dropping privileges, so the `invokeai-models` volume
+  stayed root-owned. A new one-shot `invokeai-models-init` service now chowns its
+  top level to `PUID`/`PGID` before the InvokeAI services start, and the variants
+  pass `CONTAINER_UID=${PUID:-1000}` so the runtime user matches.
 - Corrected the `README.md` agent example to request `response_format: b64_json`
   and decode `data[0].b64_json` (the bridge does not support image URLs).
 

@@ -34,6 +34,7 @@ changing this deployment's shape.
 | Service | Profile | Image | Purpose |
 | --- | --- | --- | --- |
 | `models-init` | — (one-shot) | `alpine:3.22` | Creates the ComfyUI-canonical model layout in `ai-models`. |
+| `invokeai-models-init` | — (one-shot) | `alpine:3.22` | Fixes `/models` ownership in `invokeai-models` before InvokeAI starts. |
 | `invokeai-nvidia` | `nvidia` | `${INVOKEAI_IMAGE_CUDA}` | InvokeAI WebUI + API on NVIDIA GPUs. |
 | `invokeai-amd` | `amd` | `${INVOKEAI_IMAGE_ROCM}` | InvokeAI WebUI + API on AMD GPUs (ROCm). |
 | `openai-bridge` | — (always on) | built from `./openai-bridge` | OpenAI-compatible `/v1` bridge to InvokeAI. |
@@ -102,6 +103,10 @@ InvokeAI owns its models on a dedicated named volume, `invokeai-models`, mounted
 at `/models` and configured with `INVOKEAI_MODELS_DIR=/models`. Keeping it
 outside `INVOKEAI_ROOT` means the upstream entrypoint's recursive `chown` never
 walks the model store, and the pool can later be mounted read-only into ComfyUI.
+Because the entrypoint only chowns `INVOKEAI_ROOT`, a one-shot
+`invokeai-models-init` service chowns the top level of `invokeai-models` to
+`PUID`/`PGID` before InvokeAI starts (`CONTAINER_UID=${PUID:-1000}` keeps the
+container's runtime user aligned).
 
 - Models downloaded in the InvokeAI UI land in `invokeai-models` (one `<uuid>/`
   folder per model, tracked by InvokeAI's database).
@@ -139,8 +144,8 @@ The project is structured for it:
 
 ## Operational notes
 
-- `restart: unless-stopped` everywhere except the one-shot `models-init`
-  (`restart: "no"`).
+- `restart: unless-stopped` everywhere except the one-shot `models-init` and
+  `invokeai-models-init` (`restart: "no"`).
 - No `container_name:` — Compose default naming keeps services scalable.
 - Config changes to the bridge data dir do not apply to an existing
   `bridge-data` volume; remove service + volume to reseed (see
