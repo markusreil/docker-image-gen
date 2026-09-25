@@ -1,0 +1,98 @@
+# AGENTS.md — ongoing rules for local-image-ai
+
+Short summary of the rules that stay relevant while working in this repo. See
+[`README.md`](README.md) and [`openai-bridge/README.md`](openai-bridge/README.md)
+for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
+
+## Configuration
+
+- All per-deployment config lives in `.env` (hidden, **never tracked**). Track
+  `env.example` and keep both files in the same order/shape; every variable
+  keeps its own comment. Never scatter secrets into other files.
+- Required variables use `${VAR:?}` so `docker compose config` fails fast.
+  Optional variables use `${VAR:-default}` and are documented as optional.
+- Group variables globally first, then `# --- <service> ---` sections matching
+  compose service names.
+- `BUILD_DATE` is build-time only (`${BUILD_DATE:-unknown}`); never add it to
+  `.env` / `env.example`. `BASE_IMAGE` is hardcoded in the Dockerfile.
+
+## Compose conventions
+
+- Project name is set once via `name: local-image-ai`; **never** use
+  `container_name:`.
+- `COMPOSE_PROFILES=nvidia` (in `.env`) makes the NVIDIA GPU profile the
+  default for `docker compose up`; switch with
+  `COMPOSE_PROFILES=amd docker compose up` or an explicit
+  `docker compose --profile nvidia|amd ...`.
+- The NVIDIA InvokeAI variant uses `runtime: nvidia` +
+  `NVIDIA_VISIBLE_DEVICES=all` (not a `deploy` device reservation): the Docker
+  device-request path fails CUDA initialization on some hosts. Do not
+  "simplify" it back to the `deploy` form.
+- No `ports:` anywhere. Services join the external `web-proxy` network
+  (`name: ${NGINX_PROXY_NETWORK:-web-proxy}`, `external: true`) and advertise
+  with `expose:`. Start the proxy cluster first.
+- Every proxied service declares the **complete** downstream contract:
+  `VIRTUAL_HOST`, `VIRTUAL_PORT` when needed, `ACME_HOST`, and a
+  `GEN_SELF_SIGNED_CERT` opt-in wired from `.env` with a `false` default.
+  Never hardcode `true` or omit a contract var.
+- Hostnames are anchored once in `x-hosts` and referenced via YAML aliases
+  (`*host-invokeai`, `*host-bridge`); do not copy hostname literals.
+- Use standard named volumes for stateful data (`invokeai-root`,
+  `invokeai-models`, `ai-models`, `bridge-data`); avoid host bind mounts.
+- `restart: unless-stopped` for long-running services; `restart: "no"` only
+  for the one-shot `models-init`.
+- Set Homepage labels (`homepage.group/name/icon/href/description`) on
+  long-running services; an empty icon/description renders as a blank card.
+
+## Models
+
+- InvokeAI owns its models on the `invokeai-models` volume at `/models`
+  (`INVOKEAI_MODELS_DIR=/models`, outside `INVOKEAI_ROOT`). It is the single
+  writer; never point `models_dir` at the ComfyUI-canonical tree.
+- `ai-models` is ComfyUI's own store. `models-init` creates the
+  ComfyUI-canonical layout and chowns **only the top level** (never
+  `chown -R`). Keep the directory list and the non-recursive chown in sync.
+- Future ComfyUI mounts `ai-models` at `/comfyui/models` and reads
+  `invokeai-models` read-only via `extra_model_paths.yaml`.
+
+## openai-bridge entrypoint and templates
+
+- Workflow/registry templates are tracked in `openai-bridge/templates/` and
+  rendered at **build time** via `envsubst` limited to the `SDXL_MODEL_*` build
+  args; the rendered files land in the image at
+  `/usr/local/share/openai-bridge/templates`. Never add hand-edited workflow
+  JSON to the `bridge-data` volume as the source of truth.
+- The entrypoint runs as root, recreates the `bridge` user/group to match
+  `PUID`/`PGID`, seeds `workflows/*` and `registry.json` **only on first start**
+  (`if [ ! -f ... ]`), chowns the data dir **recursively** (small config), then
+  `exec su-exec "$PUID:$PGID" ... --no-browser`. No `config.toml` is seeded —
+  all config comes from `PROXY_*` env vars.
+- Changing the model reference means rebuild **and** reseed (write-once
+  seeding); keep the reseed procedure in `openai-bridge/README.md` current.
+
+## Changelog
+
+Keep `## [Unreleased]` in `CHANGELOG.md` current as changes are made, under the
+standard subsections (`Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
+`Security`). Newest first. Do not create release sections unless asked.
+
+## Verification
+
+```sh
+cp -n env.example .env
+docker compose config -q
+docker compose --profile nvidia config -q
+docker compose --profile amd config -q
+docker compose build openai-bridge
+```
+
+Do **not** run `docker compose up` in verification: the external `web-proxy`
+network belongs to a separate proxy cluster that may not exist.
+
+## Adding ComfyUI later
+
+Use the same pattern: a `comfyui-nvidia` / `comfyui-amd` pair under the
+`nvidia` / `amd` profiles with a shared `x-comfyui-common` anchor, internal
+network alias `comfyui`, hostname `<service>.${BASE_DOMAIN}` from `x-hosts`,
+mount `ai-models:/comfyui/models`, and the full proxy contract. Update
+`CHANGELOG.md` and `env.example` with any new variables.

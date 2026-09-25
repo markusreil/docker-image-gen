@@ -1,0 +1,189 @@
+# local-image-ai — local AI image-generation stack
+#
+# Phase 1: InvokeAI WebUI + an OpenAI-compatible bridge for agents.
+# ComfyUI is anticipated (dedicated model volumes, network alias pattern,
+# nvidia/amd profile pattern) but not part of this compose file yet.
+#
+# No `ports:` anywhere: every public endpoint is owned by the external
+# reverse-proxy cluster. Start that cluster first (see README.md).
+
+name: local-image-ai
+
+# Hostnames anchored once; change BASE_DOMAIN and the whole stack moves.
+x-hosts:
+  invokeai: &host-invokeai invokeai.${BASE_DOMAIN}
+  invokeai-url: &host-invokeai-url https://invokeai.${BASE_DOMAIN}
+  bridge: &host-bridge images.${BASE_DOMAIN}
+  bridge-url: &host-bridge-url https://images.${BASE_DOMAIN}
+
+# Environment shared by the NVIDIA and AMD InvokeAI variants. It is kept in a
+# separate anchor so each variant can add its own keys via a YAML merge without
+# replacing the shared ones.
+x-invokeai-env: &invokeai-env
+  INVOKEAI_ROOT: /invokeai
+  # Models live on a dedicated volume OUTSIDE INVOKEAI_ROOT, so the
+  # entrypoint's recursive chown never walks the model store, and the pool
+  # can later be mounted read-only into ComfyUI.
+  INVOKEAI_MODELS_DIR: /models
+  INVOKEAI_HOST: 0.0.0.0
+  INVOKEAI_PORT: "9090"
+  # Full downstream proxy contract — the proxy variant decides what applies.
+  VIRTUAL_HOST: *host-invokeai
+  VIRTUAL_PORT: "9090"
+  ACME_HOST: *host-invokeai
+  GEN_SELF_SIGNED_CERT: ${INVOKEAI_GEN_SELF_SIGNED_CERT:-false}
+
+# Everything common to the NVIDIA and AMD InvokeAI variants except the image,
+# the environment (see above) and the GPU wiring.
+x-invokeai-common: &invokeai-common
+  restart: unless-stopped
+  # `expose` (not `ports`): reachable only through the proxy network.
+  expose:
+    - "9090"
+  volumes:
+    - invokeai-root:/invokeai
+    # InvokeAI's managed model store (single writer). The future ComfyUI will
+    # read this read-only; it is NOT the ComfyUI-canonical `ai-models` volume.
+    - invokeai-models:/models
+  networks:
+    internal:
+      aliases:
+        - invokeai
+    web-proxy: {}
+  labels:
+    homepage.group: AI
+    homepage.name: InvokeAI
+    homepage.icon: invokeai
+    homepage.href: *host-invokeai-url
+    homepage.description: Local AI image-generation WebUI
+
+services:
+  # One-shot seeding of ComfyUI's own model volume. Creates the
+  # ComfyUI-canonical directory layout so the later ComfyUI service has a
+  # ready download target. InvokeAI does NOT use this volume.
+  # Only the top level is chowned (NON-recursive): files created later inherit
+  # ownership from the running user, and a recursive chown would be slow here.
+  models-init:
+    image: alpine:3.22
+    restart: "no"
+    volumes:
+      - ai-models:/models
+    networks:
+      - internal
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        mkdir -p /models/checkpoints /models/diffusion_models /models/unet
+        /models/loras /models/vae /models/clip /models/text_encoders
+        /models/controlnet /models/upscale_models /models/embeddings &&
+        chown ${PUID:-1000}:${PGID:-1000} /models /models/*
+
+  invokeai-nvidia:
+    <<: *invokeai-common
+    profiles: [nvidia]
+    image: ${INVOKEAI_IMAGE_CUDA:?}
+    # Use the registered NVIDIA runtime explicitly (with NVIDIA_VISIBLE_DEVICES
+    # set, since an unset/empty value makes the runtime behave like plain runc).
+    # This is deliberate: the Compose `deploy.resources.reservations.devices`
+    # form maps to the Docker `--gpus`/device-request path, which on some hosts
+    # (observed with an RTX 5090 + driver 615 + nvidia-open) injects the device
+    # nodes but leaves CUDA unable to initialize (`cuInit` -> CUDA_ERROR_UNKNOWN
+    # / "CUDA unknown error"). The explicit runtime path initializes CUDA
+    # correctly. Requires `nvidia-ctk runtime configure --runtime=docker`.
+    runtime: nvidia
+    environment:
+      <<: *invokeai-env
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+  invokeai-amd:
+    <<: *invokeai-common
+    profiles: [amd]
+    image: ${INVOKEAI_IMAGE_ROCM:?}
+    environment:
+      <<: *invokeai-env
+    # AMD ROCm wiring. If the GPU is not recognised, add and pin the
+    # architecture explicitly, e.g. HSA_OVERRIDE_GFX_VERSION: "10.3.0".
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    shm_size: 8g
+
+  # OpenAI-compatible bridge for agents. Always on (no profile): it starts
+  # regardless of which InvokeAI variant is active and depends on both with
+  # `required: false` so the inactive profile does not block it.
+  openai-bridge:
+    build:
+      context: ./openai-bridge
+      args:
+        GO_VERSION: ${BRIDGE_GO_VERSION:-1.26.3}
+        BRIDGE_VERSION: ${BRIDGE_VERSION:?}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+        # SDXL model reference baked into the rendered workflow/registry
+        # templates at build time (see openai-bridge/README.md).
+        SDXL_MODEL_KEY: ${SDXL_MODEL_KEY:-REPLACE_WITH_MODEL_KEY}
+        SDXL_MODEL_NAME: ${SDXL_MODEL_NAME:-your-sdxl-model}
+        SDXL_MODEL_HASH: ${SDXL_MODEL_HASH:-REPLACE_WITH_MODEL_HASH}
+        SDXL_MODEL_BASE: ${SDXL_MODEL_BASE:-sdxl}
+    image: local-image-ai/openai-bridge:${BRIDGE_VERSION:?}
+    restart: unless-stopped
+    expose:
+      - "8080"
+    depends_on:
+      invokeai-nvidia:
+        condition: service_started
+        required: false
+      invokeai-amd:
+        condition: service_started
+        required: false
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      PROXY_LISTEN_IP: 0.0.0.0
+      PROXY_PORT: "8080"
+      INVOKE_URL: http://invokeai:9090
+      PROXY_DATA_DIR: /data
+      PROXY_API_KEY: ${BRIDGE_API_KEY:?}
+      PROXY_ADMIN_USER: ${BRIDGE_ADMIN_USER:?}
+      PROXY_ADMIN_PASS: ${BRIDGE_ADMIN_PASS:?}
+      PROXY_TIMEOUT: ${BRIDGE_TIMEOUT:-300s}
+      PROXY_LOG_LEVEL: ${BRIDGE_LOG_LEVEL:-info}
+      # Full downstream proxy contract.
+      VIRTUAL_HOST: *host-bridge
+      VIRTUAL_PORT: "8080"
+      ACME_HOST: *host-bridge
+      GEN_SELF_SIGNED_CERT: ${BRIDGE_GEN_SELF_SIGNED_CERT:-false}
+    volumes:
+      - bridge-data:/data
+    networks:
+      - internal
+      - web-proxy
+    labels:
+      homepage.group: AI
+      homepage.name: OpenAI Bridge
+      homepage.icon: openai
+      homepage.href: *host-bridge-url
+      homepage.description: OpenAI-compatible API bridge to InvokeAI
+
+networks:
+  # Private network for service-to-service traffic (bridge -> invokeai).
+  internal:
+    driver: bridge
+  # Owned by the external proxy cluster: same name, external, started first.
+  web-proxy:
+    name: ${NGINX_PROXY_NETWORK:-web-proxy}
+    external: true
+
+volumes:
+  invokeai-root:
+  # InvokeAI-managed model store; single writer, read-only for ComfyUI later.
+  invokeai-models:
+  # ComfyUI's own canonical download store (seeded by models-init).
+  ai-models:
+  bridge-data:

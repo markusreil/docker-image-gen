@@ -1,0 +1,73 @@
+{
+  "id": "sdxl-txt2img",
+  "nodes": {
+    "model_loader": {
+      "id": "model_loader",
+      "type": "sdxl_model_loader",
+      "is_intermediate": true,
+      "use_cache": true,
+      "model": {
+        "key": "${SDXL_MODEL_KEY}",
+        "name": "${SDXL_MODEL_NAME}",
+        "base": "${SDXL_MODEL_BASE}",
+        "type": "main",
+        "hash": "${SDXL_MODEL_HASH}"
+      }
+    },
+    "positive_prompt": {
+      "id": "positive_prompt",
+      "type": "sdxl_compel_prompt",
+      "is_intermediate": true,
+      "use_cache": true,
+      "prompt": "a beautiful landscape",
+      "style": ""
+    },
+    "negative_prompt": {
+      "id": "negative_prompt",
+      "type": "sdxl_compel_prompt",
+      "is_intermediate": true,
+      "use_cache": true,
+      "prompt": "bad quality, worst quality, lowres",
+      "style": ""
+    },
+    "noise": {
+      "id": "noise",
+      "type": "noise",
+      "is_intermediate": true,
+      "use_cache": false,
+      "seed": 0,
+      "width": 1024,
+      "height": 1024,
+      "use_cpu": true
+    },
+    "denoise": {
+      "id": "denoise",
+      "type": "denoise_latents",
+      "is_intermediate": true,
+      "use_cache": false,
+      "steps": 20,
+      "cfg_scale": 7.5,
+      "denoising_start": 0.0,
+      "denoising_end": 1.0,
+      "scheduler": "dpmpp_2m"
+    },
+    "decode": {
+      "id": "decode",
+      "type": "l2i",
+      "is_intermediate": false,
+      "use_cache": false
+    }
+  },
+  "edges": [
+    {"source": {"node_id": "model_loader", "field": "unet"}, "destination": {"node_id": "denoise", "field": "unet"}},
+    {"source": {"node_id": "model_loader", "field": "clip"}, "destination": {"node_id": "positive_prompt", "field": "clip"}},
+    {"source": {"node_id": "model_loader", "field": "clip"}, "destination": {"node_id": "negative_prompt", "field": "clip"}},
+    {"source": {"node_id": "model_loader", "field": "clip2"}, "destination": {"node_id": "positive_prompt", "field": "clip2"}},
+    {"source": {"node_id": "model_loader", "field": "clip2"}, "destination": {"node_id": "negative_prompt", "field": "clip2"}},
+    {"source": {"node_id": "positive_prompt", "field": "conditioning"}, "destination": {"node_id": "denoise", "field": "positive_conditioning"}},
+    {"source": {"node_id": "negative_prompt", "field": "conditioning"}, "destination": {"node_id": "denoise", "field": "negative_conditioning"}},
+    {"source": {"node_id": "noise", "field": "noise"}, "destination": {"node_id": "denoise", "field": "noise"}},
+    {"source": {"node_id": "denoise", "field": "latents"}, "destination": {"node_id": "decode", "field": "latents"}},
+    {"source": {"node_id": "model_loader", "field": "vae"}, "destination": {"node_id": "decode", "field": "vae"}}
+  ]
+}

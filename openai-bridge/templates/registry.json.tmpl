@@ -1,0 +1,23 @@
+{
+  "models": [
+    {
+      "id": "sdxl",
+      "workflow": "sdxl-txt2img.json",
+      "defaults": {"steps": 20, "cfg": 7.5},
+      "mapping": {
+        "prompt": "nodes.positive_prompt.prompt",
+        "negative": "nodes.negative_prompt.prompt",
+        "width": "nodes.noise.width",
+        "height": "nodes.noise.height",
+        "seed": "nodes.noise.seed",
+        "steps": "nodes.denoise.steps",
+        "cfg": "nodes.denoise.cfg_scale"
+      },
+      "size_presets": {
+        "1024x1024": {"width": 1024, "height": 1024},
+        "1792x1024": {"width": 1792, "height": 1024},
+        "1024x1792": {"width": 1024, "height": 1792}
+      }
+    }
+  ]
+}
