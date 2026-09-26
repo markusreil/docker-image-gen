@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `invokeai-rocm/Dockerfile`: a thin AMD/ROCm derivative of the upstream
+  InvokeAI image that reinstalls torch/torchvision/torchaudio/triton-rocm from
+  PyTorch's self-contained ROCm 7.2 wheels. The upstream `main-rocm` tag ships
+  ROCm 7.1, which SIGSEGVs (`exit 139`) on gfx1151 (Strix Halo / Radeon 8060S) at
+  the first GPU operation (`ROCm/TheRock#2991`, `pytorch/pytorch#173367`); ROCm
+  7.2 carries the fix.
 - Agent integration examples under `openai-bridge/examples/`: the
   `generate-image.sh` helper, an opencode custom command plus an OpenAI-Images
   MCP fragment, and an oh-my-opencode-slim `image-generation` skill plus config
@@ -42,6 +48,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `invokeai-amd` now sets gfx1151 / APU tuning
+  (`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` + `..._CACHE=1`,
+  `TORCH_BLAS_PREFER_HIPBLASLT=1`, `HSA_ENABLE_SDMA=0`,
+  `MIOPEN_FIND_MODE=HYBRID`, and `MIOPEN_USER_DB_PATH` /
+  `MIOPEN_CUSTOM_CACHE_DIR` under `/invokeai` — created by `invokeai-init` — so
+  the MIOpen kernel database persists in the `invokeai-root` volume). Without
+  AOTriton, ROCm SDPA falls back to the very slow math attention path, and
+  consumer gfx1151 has no prebuilt MIOpen kernel DB, so without the persistent
+  path every start recompiles conv kernels from source.
+- `invokeai-amd` is now built locally (`build: ./invokeai-rocm` and
+  `image: local-image-ai/invokeai-rocm:${INVOKEAI_ROCM_VERSION}`) instead of
+  pulling the upstream `main-rocm` image directly.
+- `env.example` / `.env` replace `INVOKEAI_IMAGE_ROCM` with
+  `INVOKEAI_ROCM_VERSION` (required; currently `7.2.4`).
 - The `openai-bridge` workflow templates switched from build-time `envsubst`
   substitution (via model-reference build args) to startup discovery: plain JSON
   templates are baked into the image and the model reference is resolved from
@@ -66,14 +86,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed `INVOKEAI_IMAGE_ROCM`; the AMD base image is now hardcoded in
+  `invokeai-rocm/Dockerfile` (the same convention the other Dockerfiles use).
+
 ### Fixed
 
 - Fixed InvokeAI failing to start with `PermissionError: [Errno 13] Permission
   denied: '/models/model_images'`: the upstream entrypoint only chowns
   `INVOKEAI_ROOT` before dropping privileges, so the `invokeai-models` volume
-  stayed root-owned. A new one-shot `invokeai-models-init` service now chowns its
-  top level to `PUID`/`PGID` before the InvokeAI services start, and the variants
-  pass `CONTAINER_UID=${PUID:-1000}` so the runtime user matches.
+  stayed root-owned. A new one-shot `invokeai-init` service now chowns its top
+  level to `PUID`/`PGID` (and creates the persistent MIOpen cache directory)
+  before the InvokeAI services start, and the variants pass
+  `CONTAINER_UID=${PUID:-1000}` so the runtime user matches.
 - Corrected the `README.md` agent example to request `response_format: b64_json`
   and decode `data[0].b64_json` (the bridge does not support image URLs).
 

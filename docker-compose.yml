@@ -53,10 +53,10 @@ x-invokeai-common: &invokeai-common
       aliases:
         - invokeai
     web-proxy: {}
-  # The upstream entrypoint only chowns INVOKEAI_ROOT (/invokeai) before
-  # dropping to its runtime user, so /models needs an explicit ownership fix.
+  # Prepare the model volume ownership and the persistent MIOpen cache directory
+  # before InvokeAI starts (see invokeai-init).
   depends_on:
-    invokeai-models-init:
+    invokeai-init:
       condition: service_completed_successfully
   labels:
     homepage.group: AI
@@ -87,23 +87,30 @@ services:
         /models/controlnet /models/upscale_models /models/embeddings &&
         chown ${PUID:-1000}:${PGID:-1000} /models /models/*
 
-  # One-shot ownership fix for InvokeAI's own model volume. The upstream
-  # entrypoint chowns INVOKEAI_ROOT recursively and then drops to its runtime
-  # user, but never touches INVOKEAI_MODELS_DIR (/models), leaving the volume
-  # root-owned and InvokeAI unable to create /models/model_images.
-  # Only the top level is chowned (NON-recursive): the store is large and
-  # InvokeAI creates its subdirectories as the runtime user afterwards.
-  invokeai-models-init:
+  # One-shot preparation for InvokeAI:
+  #  - chowns the top level of the invokeai-models volume. The upstream
+  #    entrypoint only chowns INVOKEAI_ROOT (/invokeai) before dropping to its
+  #    runtime user, leaving /models root-owned, so startup then fails creating
+  #    /models/model_images. NON-recursive: the store is large.
+  #  - creates the MIOpen kernel/find-db directory. Consumer gfx1151 ships no
+  #    prebuilt kernel DB and MIOpen does not create the directory itself, so
+  #    without this every restart recompiles convolution kernels from source
+  #    (minutes). See the MIOPEN_* variables on the AMD service.
+  invokeai-init:
     image: alpine:3.22
     restart: "no"
     volumes:
+      - invokeai-root:/invokeai
       - invokeai-models:/models
     networks:
       - internal
     entrypoint:
       - /bin/sh
       - -c
-      - chown ${PUID:-1000}:${PGID:-1000} /models
+      - >
+        chown ${PUID:-1000}:${PGID:-1000} /models &&
+        mkdir -p /invokeai/.miopen &&
+        chown ${PUID:-1000}:${PGID:-1000} /invokeai/.miopen
 
   invokeai-nvidia:
     <<: *invokeai-common
@@ -126,9 +133,36 @@ services:
   invokeai-amd:
     <<: *invokeai-common
     profiles: [amd]
-    image: ${INVOKEAI_IMAGE_ROCM:?}
+    # Locally built thin derivative of the upstream InvokeAI ROCm image that
+    # swaps in PyTorch's ROCm 7.2 torch wheels: ROCm 7.1 segfaults on gfx1151
+    # (Strix Halo). See invokeai-rocm/Dockerfile and README "AMD / ROCm".
+    build:
+      context: ./invokeai-rocm
+      args:
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    image: local-image-ai/invokeai-rocm:${INVOKEAI_ROCM_VERSION:?}
     environment:
       <<: *invokeai-env
+      # gfx1151 / Strix Halo tuning.
+      # ROCm SDPA falls back to the very slow math path without this; flash
+      # attention is unavailable on gfx1151, so this selects the AOTriton
+      # mem-efficient path. The cache keeps its autotuning across restarts.
+      TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: "1"
+      TORCH_ROCM_AOTRITON_ENABLE_CACHE: "1"
+      # hipBLASLt beats rocBLAS on gfx1151 inference GEMMs (10-34% in matmul
+      # sweeps). Verify with torch.backends.cuda.preferred_blas_library().
+      TORCH_BLAS_PREFER_HIPBLASLT: "1"
+      # SDMA is unreliable on APUs (VAE hangs); costs ~nothing on unified memory.
+      HSA_ENABLE_SDMA: "0"
+      # Consumer gfx1151 ships no prebuilt MIOpen kernel DB, so the find-db and
+      # compiled kernels MUST live on a persistent path or every start re-tunes /
+      # recompiles conv shapes from source (minutes). invokeai-init creates it.
+      MIOPEN_FIND_MODE: HYBRID
+      MIOPEN_USER_DB_PATH: /invokeai/.miopen
+      MIOPEN_CUSTOM_CACHE_DIR: /invokeai/.miopen
+      # HIP allocator (the CUDA var is ignored on ROCm builds).
+      # expandable_segments is NOT supported on this ROCm build.
+      PYTORCH_HIP_ALLOC_CONF: garbage_collection_threshold:0.8,max_split_size_mb:512
     # AMD ROCm wiring. If the GPU is not recognised, add and pin the
     # architecture explicitly, e.g. HSA_OVERRIDE_GFX_VERSION: "10.3.0".
     devices:

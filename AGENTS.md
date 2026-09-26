@@ -28,6 +28,12 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
   `NVIDIA_VISIBLE_DEVICES=all` (not a `deploy` device reservation): the Docker
   device-request path fails CUDA initialization on some hosts. Do not
   "simplify" it back to the `deploy` form.
+- The AMD InvokeAI variant is built locally from `invokeai-rocm/Dockerfile`, a
+  thin derivative of the upstream `main-rocm` image that swaps torch to
+  PyTorch's self-contained ROCm 7.2 wheels (ROCm 7.1 SIGSEGVs on gfx1151 /
+  Strix Halo). The base image and wheel versions stay hardcoded in the
+  Dockerfile; `INVOKEAI_ROCM_VERSION` tags the built image. Remove the
+  derivative once upstream ships ROCm >= 7.2.
 - No `ports:` anywhere. Services join the external `web-proxy` network
   (`name: ${NGINX_PROXY_NETWORK:-web-proxy}`, `external: true`) and advertise
   with `expose:`. Start the proxy cluster first.
@@ -40,7 +46,7 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 - Use standard named volumes for stateful data (`invokeai-root`,
   `invokeai-models`, `ai-models`, `bridge-data`); avoid host bind mounts.
 - `restart: unless-stopped` for long-running services; `restart: "no"` only
-  for the one-shot `models-init` / `invokeai-models-init`.
+  for the one-shot `models-init` / `invokeai-init`.
 - Set Homepage labels (`homepage.group/name/icon/href/description`) on
   long-running services; an empty icon/description renders as a blank card.
 
@@ -49,9 +55,10 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 - InvokeAI owns its models on the `invokeai-models` volume at `/models`
   (`INVOKEAI_MODELS_DIR=/models`, outside `INVOKEAI_ROOT`). It is the single
   writer; never point `models_dir` at the ComfyUI-canonical tree. The one-shot
-  `invokeai-models-init` chowns the volume top level to `PUID`/`PGID`: the
-  upstream entrypoint only chowns `INVOKEAI_ROOT`, so without it `/models` stays
-  root-owned and startup fails.
+  `invokeai-init` chowns the volume top level to `PUID`/`PGID` and creates the
+  persistent MIOpen cache dir: the upstream entrypoint only chowns
+  `INVOKEAI_ROOT`, so without it `/models` stays root-owned and startup fails,
+  and MIOpen would recompile convolution kernels on every restart.
 - `ai-models` is ComfyUI's own store. `models-init` creates the
   ComfyUI-canonical layout and chowns **only the top level** (never
   `chown -R`). Keep the directory list and the non-recursive chown in sync.
@@ -92,6 +99,7 @@ docker compose config -q
 docker compose --profile nvidia config -q
 docker compose --profile amd config -q
 docker compose build openai-bridge
+docker compose --profile amd build invokeai-amd
 ```
 
 Do **not** run `docker compose up` in verification: the external `web-proxy`
