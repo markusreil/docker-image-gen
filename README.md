@@ -34,9 +34,9 @@ changing this deployment's shape.
 | Service | Profile | Image | Purpose |
 | --- | --- | --- | --- |
 | `models-init` | — (one-shot) | `alpine:3.22` | Creates the ComfyUI-canonical model layout in `ai-models`. |
-| `invokeai-models-init` | — (one-shot) | `alpine:3.22` | Fixes `/models` ownership in `invokeai-models` before InvokeAI starts. |
+| `invokeai-init` | — (one-shot) | `alpine:3.22` | Fixes `invokeai-models` ownership and creates the MIOpen cache dir before InvokeAI starts. |
 | `invokeai-nvidia` | `nvidia` | `${INVOKEAI_IMAGE_CUDA}` | InvokeAI WebUI + API on NVIDIA GPUs. |
-| `invokeai-amd` | `amd` | `${INVOKEAI_IMAGE_ROCM}` | InvokeAI WebUI + API on AMD GPUs (ROCm). |
+| `invokeai-amd` | `amd` | built from `invokeai-rocm/Dockerfile` | InvokeAI WebUI + API on AMD GPUs (ROCm 7.2 derivative). |
 | `openai-bridge` | — (always on) | built from `./openai-bridge` | OpenAI-compatible `/v1` bridge to InvokeAI. |
 
 All state lives in named volumes: `invokeai-root`, `invokeai-models`,
@@ -72,7 +72,8 @@ separate proxy cluster that may not exist on every host.
   The NVIDIA variant uses `runtime: nvidia` (see [Troubleshooting](#troubleshooting)).
 - **AMD**: a ROCm-capable kernel driver (`amdgpu`), plus membership/access to
   the `video` and `render` groups on the host. The service passes `/dev/kfd`
-  and `/dev/dri` through and sets `shm_size: 8g`.
+  and `/dev/dri` through and sets `shm_size: 8g`. The AMD image is built locally
+  on first use (see [AMD / ROCm](#amd--rocm-rocm-72-derivative)).
 - A running reverse-proxy cluster that created the `web-proxy` network and
   serves `BASE_DOMAIN`.
 
@@ -103,10 +104,10 @@ InvokeAI owns its models on a dedicated named volume, `invokeai-models`, mounted
 at `/models` and configured with `INVOKEAI_MODELS_DIR=/models`. Keeping it
 outside `INVOKEAI_ROOT` means the upstream entrypoint's recursive `chown` never
 walks the model store, and the pool can later be mounted read-only into ComfyUI.
-Because the entrypoint only chowns `INVOKEAI_ROOT`, a one-shot
-`invokeai-models-init` service chowns the top level of `invokeai-models` to
-`PUID`/`PGID` before InvokeAI starts (`CONTAINER_UID=${PUID:-1000}` keeps the
-container's runtime user aligned).
+Because the entrypoint only chowns `INVOKEAI_ROOT`, a one-shot `invokeai-init`
+service chowns the top level of `invokeai-models` to `PUID`/`PGID` and creates
+the persistent MIOpen cache directory before InvokeAI starts
+(`CONTAINER_UID=${PUID:-1000}` keeps the container's runtime user aligned).
 
 - Models downloaded in the InvokeAI UI land in `invokeai-models` (one `<uuid>/`
   folder per model, tracked by InvokeAI's database).
@@ -145,7 +146,7 @@ The project is structured for it:
 ## Operational notes
 
 - `restart: unless-stopped` everywhere except the one-shot `models-init` and
-  `invokeai-models-init` (`restart: "no"`).
+  `invokeai-init` (`restart: "no"`).
 - No `container_name:` — Compose default naming keeps services scalable.
 - Config changes to the bridge data dir do not apply to an existing
   `bridge-data` volume; remove service + volume to reseed (see
@@ -179,6 +180,54 @@ hit the error:
 3. If it returns `999`, the host driver/toolkit is at fault: regenerate the CDI
    spec, confirm the running kernel module matches `nvidia-utils`, and reboot
    after driver updates.
+
+### AMD / ROCm (ROCm 7.2 derivative)
+
+The upstream `main-rocm` image ships the ROCm 7.1 torch stack, which SIGSEGVs
+(`exit 139`) on gfx1151 (Strix Halo / Radeon 8060S) at the first GPU operation:
+ROCm 7.1 computes an incorrect VGPR count for gfx1151 (`ROCm/TheRock#2991`,
+`pytorch/pytorch#173367`). `torch.cuda.is_available()` returns `True` and
+`gfx1151` is in `torch.cuda.get_arch_list()`, so the fault is easy to
+misdiagnose; no `HSA_OVERRIDE_GFX_VERSION` / `HSA_ENABLE_SDMA` setting fixes it.
+
+`invokeai-rocm/Dockerfile` builds a thin derivative of the upstream image and
+reinstalls torch/torchvision/torchaudio/triton-rocm from PyTorch's ROCm 7.2 wheel
+index (the torch 2.11.0 line), which bundles the fixed runtime. `docker compose --profile
+amd up` builds it automatically; bump `INVOKEAI_ROCM_VERSION` to move ROCm
+versions, or delete the Dockerfile and go back to a plain upstream `image:` once
+`main-rocm` ships ROCm >= 7.2 (InvokeAI issue #9130).
+
+Verify the swap inside the running container:
+
+```sh
+COMPOSE_PROFILES=amd docker compose exec invokeai-amd python -c \
+  "import torch; print(torch.__version__, torch.version.hip)"
+```
+
+Expect a `+rocm7.2` build rather than `+rocm7.1`. The benign bitsandbytes
+`rocminfo` warning (`No such file or directory: 'rocminfo'`) is unrelated and
+can be ignored.
+
+The AMD service also sets gfx1151 / APU performance variables:
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` + `..._CACHE=1` (without AOTriton,
+ROCm SDPA falls back to the very slow math path — the container logs a warning
+asking for this), `TORCH_BLAS_PREFER_HIPBLASLT=1` (hipBLASLt is materially faster
+than rocBLAS on gfx1151 inference GEMMs), `HSA_ENABLE_SDMA=0` (SDMA is unreliable
+on APUs and can hang the VAE), and `MIOPEN_FIND_MODE=HYBRID` with
+`MIOPEN_USER_DB_PATH` / `MIOPEN_CUSTOM_CACHE_DIR` under `/invokeai` so the
+compiled-kernel find-db persists in the `invokeai-root` volume. The first
+generation after the database is built is slow (MIOpen compiles/tunes conv
+kernels once); later generations — and later restarts — reuse it. Verify
+hipBLASLt is active with:
+
+```sh
+COMPOSE_PROFILES=amd docker compose exec invokeai-amd python -c \
+  "import torch; print(torch.backends.cuda.preferred_blas_library())"
+```
+
+Expect `Cublaslt`, not `Cublas`. On gfx1151 the realistic SDXL 1024² / 30-step
+band is roughly 15-20 s (about 6-8x behind an RTX 5090); the gap is memory
+bandwidth and compute, not configuration.
 
 ## Agent usage example
 
