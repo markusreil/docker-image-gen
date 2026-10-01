@@ -35,7 +35,7 @@ Build directly if needed:
 
 ```sh
 docker build --build-arg BRIDGE_VERSION=v1.6 \
-  -t local-image-ai/openai-bridge:v1.6 .
+  -t image-ai/openai-bridge:v1.6 .
 ```
 
 ## Configuration
@@ -196,7 +196,7 @@ current image — for example to re-run discovery after installing an SDXL model
 
 ```sh
 docker compose rm -sf openai-bridge
-docker volume rm local-image-ai_bridge-data
+docker volume rm image-ai_bridge-data
 docker compose up -d openai-bridge
 ```
 

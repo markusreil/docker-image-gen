@@ -1,18 +1,21 @@
-# local-image-ai — local AI image-generation stack
+# image-ai — local AI image-generation stack
 #
-# Phase 1: InvokeAI WebUI + an OpenAI-compatible bridge for agents.
-# ComfyUI is anticipated (dedicated model volumes, network alias pattern,
-# nvidia/amd profile pattern) but not part of this compose file yet.
+# InvokeAI and ComfyUI WebUIs share the nvidia/amd profile pattern, plus an
+# OpenAI-compatible bridge for agents. `ai-models` is the shared
+# ComfyUI-canonical model store; InvokeAI manages its own `invokeai-models`
+# volume (flat <uuid>/ layout, not consumable by ComfyUI).
 #
 # No `ports:` anywhere: every public endpoint is owned by the external
 # reverse-proxy cluster. Start that cluster first (see README.md).
 
-name: local-image-ai
+name: image-ai
 
 # Hostnames anchored once; change BASE_DOMAIN and the whole stack moves.
 x-hosts:
   invokeai: &host-invokeai invokeai.${BASE_DOMAIN}
   invokeai-url: &host-invokeai-url https://invokeai.${BASE_DOMAIN}
+  comfyui: &host-comfyui comfyui.${BASE_DOMAIN}
+  comfyui-url: &host-comfyui-url https://comfyui.${BASE_DOMAIN}
   bridge: &host-bridge images.${BASE_DOMAIN}
   bridge-url: &host-bridge-url https://images.${BASE_DOMAIN}
 
@@ -22,8 +25,8 @@ x-hosts:
 x-invokeai-env: &invokeai-env
   INVOKEAI_ROOT: /invokeai
   # Models live on a dedicated volume OUTSIDE INVOKEAI_ROOT, so the
-  # entrypoint's recursive chown never walks the model store, and the pool
-  # can later be mounted read-only into ComfyUI.
+  # entrypoint's recursive chown never walks the model store, and the store is
+  # separate from ComfyUI's `ai-models` volume.
   INVOKEAI_MODELS_DIR: /models
   INVOKEAI_HOST: 0.0.0.0
   INVOKEAI_PORT: "9090"
@@ -36,6 +39,24 @@ x-invokeai-env: &invokeai-env
   ACME_HOST: *host-invokeai
   GEN_SELF_SIGNED_CERT: ${INVOKEAI_GEN_SELF_SIGNED_CERT:-false}
 
+# gfx1151 / Strix Halo ROCm tuning shared by the AMD InvokeAI and AMD ComfyUI
+# variants. The MIOpen cache *paths* differ per service and are set locally.
+x-rocm-tuning: &rocm-tuning
+  # ROCm SDPA falls back to the very slow math path without AOTriton; flash
+  # attention is unavailable on gfx1151, so this selects the AOTriton
+  # mem-efficient path. The cache keeps its autotuning across restarts.
+  TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: "1"
+  TORCH_ROCM_AOTRITON_ENABLE_CACHE: "1"
+  # hipBLASLt beats rocBLAS on gfx1151 inference GEMMs (10-34% in matmul
+  # sweeps). Verify with torch.backends.cuda.preferred_blas_library().
+  TORCH_BLAS_PREFER_HIPBLASLT: "1"
+  # SDMA is unreliable on APUs (VAE hangs); costs ~nothing on unified memory.
+  HSA_ENABLE_SDMA: "0"
+  # Consumer gfx1151 ships no prebuilt MIOpen kernel DB, so the find-db and
+  # compiled kernels MUST live on a persistent path (per-service below) or every
+  # start re-tunes / recompiles conv shapes from source (minutes).
+  MIOPEN_FIND_MODE: HYBRID
+
 # Everything common to the NVIDIA and AMD InvokeAI variants except the image,
 # the environment (see above) and the GPU wiring.
 x-invokeai-common: &invokeai-common
@@ -45,8 +66,10 @@ x-invokeai-common: &invokeai-common
     - "9090"
   volumes:
     - invokeai-root:/invokeai
-    # InvokeAI's managed model store (single writer). The future ComfyUI will
-    # read this read-only; it is NOT the ComfyUI-canonical `ai-models` volume.
+    # InvokeAI's managed model store (single writer). Stored flat as
+    # <uuid>/model.safetensors and tracked by InvokeAI's database, so ComfyUI
+    # cannot consume it directly; `ai-models` is the shared ComfyUI-canonical
+    # volume (see README "Model storage").
     - invokeai-models:/models
   networks:
     internal:
@@ -65,10 +88,55 @@ x-invokeai-common: &invokeai-common
     homepage.href: *host-invokeai-url
     homepage.description: Local AI image-generation WebUI
 
+# Environment shared by the NVIDIA and AMD ComfyUI variants.
+x-comfyui-env: &comfyui-env
+  # Full downstream proxy contract — the proxy variant decides what applies.
+  VIRTUAL_HOST: *host-comfyui
+  VIRTUAL_PORT: "8188"
+  ACME_HOST: *host-comfyui
+  GEN_SELF_SIGNED_CERT: ${COMFYUI_GEN_SELF_SIGNED_CERT:-false}
+
+# Everything common to the NVIDIA and AMD ComfyUI variants except the image and
+# the GPU wiring. Both variants use the same third-party image family, so the
+# container paths are identical.
+x-comfyui-common: &comfyui-common
+  restart: unless-stopped
+  # `expose` (not `ports`): reachable only through the proxy network.
+  expose:
+    - "8188"
+  volumes:
+    # ComfyUI's own canonical model store (seeded by models-init). This is the
+    # shared byte source for both WebUIs: export from InvokeAI or download here,
+    # then import into InvokeAI as an external (absolute-path) model.
+    - ai-models:/comfyui/models
+    - comfyui-nodes:/comfyui/custom_nodes
+    - comfyui-user:/comfyui/user
+    - comfyui-input:/comfyui/input
+    - comfyui-output:/comfyui/output
+    # torch / HuggingFace / MIOpen caches. comfyui-init creates the MIOpen
+    # subdir; without a persistent path gfx1151 recompiles kernels on every boot.
+    - comfyui-cache:/root/.cache
+  networks:
+    internal:
+      aliases:
+        - comfyui
+    web-proxy: {}
+  depends_on:
+    models-init:
+      condition: service_completed_successfully
+    comfyui-init:
+      condition: service_completed_successfully
+  labels:
+    homepage.group: AI
+    homepage.name: ComfyUI
+    homepage.icon: comfyui
+    homepage.href: *host-comfyui-url
+    homepage.description: Node-based AI image-generation WebUI
+
 services:
   # One-shot seeding of ComfyUI's own model volume. Creates the
-  # ComfyUI-canonical directory layout so the later ComfyUI service has a
-  # ready download target. InvokeAI does NOT use this volume.
+  # ComfyUI-canonical directory layout so the ComfyUI services have a ready
+  # download target. InvokeAI does NOT use this volume.
   # Only the top level is chowned (NON-recursive): files created later inherit
   # ownership from the running user, and a recursive chown would be slow here.
   models-init:
@@ -112,6 +180,24 @@ services:
         mkdir -p /invokeai/.miopen &&
         chown ${PUID:-1000}:${PGID:-1000} /invokeai/.miopen
 
+  # One-shot creation of ComfyUI's persistent caches. The third-party image runs
+  # as root, so its data volumes need no chown; only the MIOpen find-db directory
+  # must exist before startup (MIOpen does not create it) or the AMD variant
+  # recompiles convolution kernels on every boot.
+  comfyui-init:
+    image: alpine:3.22
+    restart: "no"
+    volumes:
+      - comfyui-cache:/cache
+    networks:
+      - internal
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        mkdir -p /cache/miopen &&
+        chown ${PUID:-1000}:${PGID:-1000} /cache /cache/miopen
+
   invokeai-nvidia:
     <<: *invokeai-common
     profiles: [nvidia]
@@ -140,24 +226,11 @@ services:
       context: ./invokeai-rocm
       args:
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    image: local-image-ai/invokeai-rocm:${INVOKEAI_ROCM_VERSION:?}
+    image: image-ai/invokeai-rocm:${INVOKEAI_ROCM_VERSION:?}
     environment:
-      <<: *invokeai-env
-      # gfx1151 / Strix Halo tuning.
-      # ROCm SDPA falls back to the very slow math path without this; flash
-      # attention is unavailable on gfx1151, so this selects the AOTriton
-      # mem-efficient path. The cache keeps its autotuning across restarts.
-      TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: "1"
-      TORCH_ROCM_AOTRITON_ENABLE_CACHE: "1"
-      # hipBLASLt beats rocBLAS on gfx1151 inference GEMMs (10-34% in matmul
-      # sweeps). Verify with torch.backends.cuda.preferred_blas_library().
-      TORCH_BLAS_PREFER_HIPBLASLT: "1"
-      # SDMA is unreliable on APUs (VAE hangs); costs ~nothing on unified memory.
-      HSA_ENABLE_SDMA: "0"
-      # Consumer gfx1151 ships no prebuilt MIOpen kernel DB, so the find-db and
-      # compiled kernels MUST live on a persistent path or every start re-tunes /
-      # recompiles conv shapes from source (minutes). invokeai-init creates it.
-      MIOPEN_FIND_MODE: HYBRID
+      <<: [*invokeai-env, *rocm-tuning]
+      # Persistent MIOpen kernel/find-db for the AMD variant (created by
+      # invokeai-init).
       MIOPEN_USER_DB_PATH: /invokeai/.miopen
       MIOPEN_CUSTOM_CACHE_DIR: /invokeai/.miopen
       # HIP allocator (the CUDA var is ignored on ROCm builds).
@@ -165,6 +238,45 @@ services:
       PYTORCH_HIP_ALLOC_CONF: garbage_collection_threshold:0.8,max_split_size_mb:512
     # AMD ROCm wiring. If the GPU is not recognised, add and pin the
     # architecture explicitly, e.g. HSA_OVERRIDE_GFX_VERSION: "10.3.0".
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    shm_size: 8g
+
+  comfyui-nvidia:
+    <<: *comfyui-common
+    profiles: [nvidia]
+    # No official ComfyUI image exists; this is a maintained community image
+    # (CUDA 13.0.3). See README "ComfyUI".
+    image: ${COMFYUI_IMAGE_CUDA:?}
+    # Same explicit NVIDIA runtime path as invokeai-nvidia: the Compose device
+    # reservation path can leave CUDA unable to initialize on some hosts.
+    runtime: nvidia
+    environment:
+      <<: *comfyui-env
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+  comfyui-amd:
+    <<: *comfyui-common
+    profiles: [amd]
+    # Same maintained image family, AMD/ROCm 7.2.3 build (torch 2.11.0). The
+    # ROCm 7.2 line is required on gfx1151 (Strix Halo). See README "ComfyUI".
+    image: ${COMFYUI_IMAGE_ROCM:?}
+    environment:
+      <<: [*comfyui-env, *rocm-tuning]
+      # Persistent MIOpen find-db/kernel cache for ComfyUI (created by
+      # comfyui-init; the volume is mounted at /root/.cache).
+      MIOPEN_USER_DB_PATH: /root/.cache/miopen
+      MIOPEN_CUSTOM_CACHE_DIR: /root/.cache/miopen
+      # HIP allocator (the CUDA var is ignored on ROCm builds).
+      PYTORCH_HIP_ALLOC_CONF: garbage_collection_threshold:0.8,max_split_size_mb:512
+    # AMD ROCm wiring (same as invokeai-amd).
     devices:
       - /dev/kfd
       - /dev/dri
@@ -185,7 +297,7 @@ services:
         GO_VERSION: ${BRIDGE_GO_VERSION:-1.26.3}
         BRIDGE_VERSION: ${BRIDGE_VERSION:?}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    image: local-image-ai/openai-bridge:${BRIDGE_VERSION:?}
+    image: image-ai/openai-bridge:${BRIDGE_VERSION:?}
     restart: unless-stopped
     expose:
       - "8080"
@@ -238,8 +350,16 @@ networks:
 
 volumes:
   invokeai-root:
-  # InvokeAI-managed model store; single writer, read-only for ComfyUI later.
+  # InvokeAI-managed model store; single writer, not consumable by ComfyUI
+  # (flat <uuid>/ layout).
   invokeai-models:
-  # ComfyUI's own canonical download store (seeded by models-init).
+  # ComfyUI's own canonical model store (seeded by models-init), shared with
+  # InvokeAI via external (absolute-path) imports.
   ai-models:
+  # ComfyUI's persistent state.
+  comfyui-nodes:
+  comfyui-user:
+  comfyui-input:
+  comfyui-output:
+  comfyui-cache:
   bridge-data:

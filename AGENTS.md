@@ -1,4 +1,4 @@
-# AGENTS.md — ongoing rules for local-image-ai
+# AGENTS.md — ongoing rules for image-ai
 
 Short summary of the rules that stay relevant while working in this repo. See
 [`README.md`](README.md) and [`openai-bridge/README.md`](openai-bridge/README.md)
@@ -18,13 +18,13 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 
 ## Compose conventions
 
-- Project name is set once via `name: local-image-ai`; **never** use
+- Project name is set once via `name: image-ai`; **never** use
   `container_name:`.
 - `COMPOSE_PROFILES=nvidia` (in `.env`) makes the NVIDIA GPU profile the
   default for `docker compose up`; switch with
   `COMPOSE_PROFILES=amd docker compose up` or an explicit
   `docker compose --profile nvidia|amd ...`.
-- The NVIDIA InvokeAI variant uses `runtime: nvidia` +
+- The NVIDIA InvokeAI and ComfyUI variants use `runtime: nvidia` +
   `NVIDIA_VISIBLE_DEVICES=all` (not a `deploy` device reservation): the Docker
   device-request path fails CUDA initialization on some hosts. Do not
   "simplify" it back to the `deploy` form.
@@ -34,6 +34,14 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
   Strix Halo). The base image and wheel versions stay hardcoded in the
   Dockerfile; `INVOKEAI_ROCM_VERSION` tags the built image. Remove the
   derivative once upstream ships ROCm >= 7.2.
+- ComfyUI has **no official image**. Both variants use one third-party family
+  (`ghcr.io/radiatingreverberations/comfyui-extensions`, CUDA tag vs `amd-*`
+  ROCm 7.2.3) so the shared `x-comfyui-common` container paths stay identical.
+  The image runs as root and already serves `0.0.0.0:8188`;
+  `COMFYUI_IMAGE_CUDA` / `COMFYUI_IMAGE_ROCM` are required. Do not point it at
+  `invokeai-models` (flat `<uuid>/` store — see Models).
+- The gfx1151 ROCm tuning shared by `invokeai-amd` and `comfyui-amd` lives in
+  the `x-rocm-tuning` anchor; only the MIOpen cache *paths* are set per service.
 - No `ports:` anywhere. Services join the external `web-proxy` network
   (`name: ${NGINX_PROXY_NETWORK:-web-proxy}`, `external: true`) and advertise
   with `expose:`. Start the proxy cluster first.
@@ -42,11 +50,14 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
   `GEN_SELF_SIGNED_CERT` opt-in wired from `.env` with a `false` default.
   Never hardcode `true` or omit a contract var.
 - Hostnames are anchored once in `x-hosts` and referenced via YAML aliases
-  (`*host-invokeai`, `*host-bridge`); do not copy hostname literals.
+  (`*host-invokeai`, `*host-comfyui`, `*host-bridge`); do not copy hostname
+  literals.
 - Use standard named volumes for stateful data (`invokeai-root`,
-  `invokeai-models`, `ai-models`, `bridge-data`); avoid host bind mounts.
+  `invokeai-models`, `ai-models`, `comfyui-nodes`, `comfyui-user`,
+  `comfyui-input`, `comfyui-output`, `comfyui-cache`, `bridge-data`); avoid host
+  bind mounts.
 - `restart: unless-stopped` for long-running services; `restart: "no"` only
-  for the one-shot `models-init` / `invokeai-init`.
+  for the one-shot `models-init` / `invokeai-init` / `comfyui-init`.
 - Set Homepage labels (`homepage.group/name/icon/href/description`) on
   long-running services; an empty icon/description renders as a blank card.
 
@@ -54,16 +65,21 @@ for detail; see `/specs/COMPOSE-SPEC.md` for the full compose conventions.
 
 - InvokeAI owns its models on the `invokeai-models` volume at `/models`
   (`INVOKEAI_MODELS_DIR=/models`, outside `INVOKEAI_ROOT`). It is the single
-  writer; never point `models_dir` at the ComfyUI-canonical tree. The one-shot
-  `invokeai-init` chowns the volume top level to `PUID`/`PGID` and creates the
-  persistent MIOpen cache dir: the upstream entrypoint only chowns
-  `INVOKEAI_ROOT`, so without it `/models` stays root-owned and startup fails,
-  and MIOpen would recompile convolution kernels on every restart.
-- `ai-models` is ComfyUI's own store. `models-init` creates the
-  ComfyUI-canonical layout and chowns **only the top level** (never
-  `chown -R`). Keep the directory list and the non-recursive chown in sync.
-- Future ComfyUI mounts `ai-models` at `/comfyui/models` and reads
-  `invokeai-models` read-only via `extra_model_paths.yaml`.
+  writer and, since InvokeAI 6.9, stores models flat as
+  `<uuid>/model.safetensors` tracked in its database — opaque to ComfyUI. Never
+  point `models_dir` at the ComfyUI tree. The one-shot `invokeai-init` chowns the
+  volume top level to `PUID`/`PGID` and creates the persistent MIOpen cache dir:
+  the upstream entrypoint only chowns `INVOKEAI_ROOT`, so without it `/models`
+  stays root-owned and startup fails, and MIOpen would recompile convolution
+  kernels on every restart.
+- `ai-models` is ComfyUI's canonical store and the shared byte source. Both
+  ComfyUI variants mount it at `/comfyui/models`; `models-init` creates the
+  canonical layout and chowns **only the top level** (never `chown -R`). Keep
+  the directory list and the non-recursive chown in sync. InvokeAI consumes it
+  only via external (absolute-path) model imports — never mount
+  `invokeai-models` into ComfyUI.
+- `invokeai-init` / `comfyui-init` create the persistent MIOpen caches
+  (under `invokeai-root` and in the `comfyui-cache` volume respectively).
 
 ## openai-bridge entrypoint and templates
 
@@ -105,10 +121,21 @@ docker compose --profile amd build invokeai-amd
 Do **not** run `docker compose up` in verification: the external `web-proxy`
 network belongs to a separate proxy cluster that may not exist.
 
-## Adding ComfyUI later
+The ComfyUI images are third-party and pulled, not built here, so only
+`docker compose config` validates them.
 
-Use the same pattern: a `comfyui-nvidia` / `comfyui-amd` pair under the
-`nvidia` / `amd` profiles with a shared `x-comfyui-common` anchor, internal
-network alias `comfyui`, hostname `<service>.${BASE_DOMAIN}` from `x-hosts`,
-mount `ai-models:/comfyui/models`, and the full proxy contract. Update
-`CHANGELOG.md` and `env.example` with any new variables.
+## ComfyUI
+
+- `comfyui-nvidia` / `comfyui-amd` under the `nvidia` / `amd` profiles share
+  `x-comfyui-common` + `x-comfyui-env`, the internal alias `comfyui`, and the
+  hostname `comfyui.${BASE_DOMAIN}`. `comfyui-amd` also uses the shared
+  `x-rocm-tuning` anchor.
+- Persistent volumes: `ai-models:/comfyui/models`, `comfyui-nodes`,
+  `comfyui-user`, `comfyui-input`, `comfyui-output`, and
+  `comfyui-cache:/root/.cache` (MIOpen find-db + torch/HF caches).
+- The image is pinned by `COMFYUI_IMAGE_CUDA` / `COMFYUI_IMAGE_ROCM` in `.env`.
+  `latest` / `amd-latest` move; pin a version tag or digest for reproducible
+  deployments.
+- The image runs as root, so ComfyUI's data volumes are root-owned (unlike
+  InvokeAI's `PUID`-owned store). `comfyui-init` only creates the MIOpen cache
+  dir.

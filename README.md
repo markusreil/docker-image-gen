@@ -1,32 +1,34 @@
-# local-image-ai
+# image-ai
 
-A local, self-hosted AI image-generation stack. Phase 1 ships the **InvokeAI
-WebUI** for interactive use and an **OpenAI-compatible bridge** so agents and
-OpenAI-API clients can generate images. **ComfyUI** will be added later without
-changing this deployment's shape.
+A local, self-hosted AI image-generation stack. It ships the **InvokeAI** and
+**ComfyUI** WebUIs for interactive use and an **OpenAI-compatible bridge** so
+agents and OpenAI-API clients can generate images. Both WebUIs run on the same
+NVIDIA/AMD profile pattern and share the ComfyUI-canonical `ai-models` store.
 
 ## Architecture
 
 ```
-  agents / OpenAI SDK                you (browser)
-        │                                 │
-        │ https://images.<domain>/v1      │ https://invokeai.<domain>
-        ▼                                 ▼
+  agents / OpenAI SDK                     you (browser)
+        │                    ┌──────────────────┴──────────────────┐
+        │ images.<domain>/v1 │ invokeai.<domain>   comfyui.<domain> │
+        ▼                    ▼                                     ▼
   ┌────────────────────────── external reverse-proxy cluster ──────────────────────────┐
   │                    (owns all public endpoints; no host ports here)                  │
-  └───────────────┬───────────────────────────────────────────┬────────────────────────┘
-                  │ web-proxy network                         │ web-proxy network
-                  ▼                                           ▼
-         ┌─────────────────┐   internal network       ┌──────────────────────┐
-         │  openai-bridge  │ ───────────────────────▶ │  invokeai (nvidia|amd)│
-         │   :8080         │   http://invokeai:9090   │       :9090           │
-         └────────┬────────┘                          └───────────┬──────────┘
-                  │ /data (bridge-data)                           │ /invokeai (invokeai-root)
-                   │                                               │ /models (invokeai-models)
-                   └───────────────────────────────────────────────┘
-      invokeai-models = InvokeAI-managed models, single writer. ComfyUI will
-      read it read-only later; ai-models (seeded by models-init) is ComfyUI's
-      own canonical download store.
+  └───────┬──────────────────────┬─────────────────────────┬───────────────────────────┘
+          │ web-proxy            │ web-proxy               │ web-proxy
+          ▼                      ▼                         ▼
+   ┌───────────────┐   internal  ┌────────────────────┐   ┌────────────────────┐
+   │ openai-bridge │ ──────────▶ │ invokeai nvidia|amd│   │ comfyui nvidia|amd │
+   │    :8080      │   :9090     │        :9090       │   │        :8188       │
+   └───────┬───────┘             └──────────┬─────────┘   └──────────┬─────────┘
+           │ /data (bridge-data)            │ /invokeai             │ /comfyui/*
+           │                                │ /models (invokeai-    │ /comfyui/models
+           │                                │         models)       │         (ai-models)
+           └────────────────────────────────┴───────────────────────┘
+      ai-models (seeded by models-init) is the shared ComfyUI-canonical store.
+      invokeai-models is InvokeAI's own flat <uuid>/ store and is NOT
+      consumable by ComfyUI; share bytes by importing from ai-models into
+      InvokeAI as external (absolute-path) models.
 ```
 
 ## Services
@@ -35,12 +37,16 @@ changing this deployment's shape.
 | --- | --- | --- | --- |
 | `models-init` | — (one-shot) | `alpine:3.22` | Creates the ComfyUI-canonical model layout in `ai-models`. |
 | `invokeai-init` | — (one-shot) | `alpine:3.22` | Fixes `invokeai-models` ownership and creates the MIOpen cache dir before InvokeAI starts. |
+| `comfyui-init` | — (one-shot) | `alpine:3.22` | Creates ComfyUI's persistent MIOpen cache dir. |
 | `invokeai-nvidia` | `nvidia` | `${INVOKEAI_IMAGE_CUDA}` | InvokeAI WebUI + API on NVIDIA GPUs. |
 | `invokeai-amd` | `amd` | built from `invokeai-rocm/Dockerfile` | InvokeAI WebUI + API on AMD GPUs (ROCm 7.2 derivative). |
+| `comfyui-nvidia` | `nvidia` | `${COMFYUI_IMAGE_CUDA}` | ComfyUI WebUI on NVIDIA GPUs. |
+| `comfyui-amd` | `amd` | `${COMFYUI_IMAGE_ROCM}` | ComfyUI WebUI on AMD GPUs (ROCm 7.2.3). |
 | `openai-bridge` | — (always on) | built from `./openai-bridge` | OpenAI-compatible `/v1` bridge to InvokeAI. |
 
 All state lives in named volumes: `invokeai-root`, `invokeai-models`,
-`ai-models`, `bridge-data`.
+`ai-models`, `comfyui-nodes`, `comfyui-user`, `comfyui-input`,
+`comfyui-output`, `comfyui-cache`, `bridge-data`.
 
 ## Quickstart
 
@@ -71,9 +77,12 @@ separate proxy cluster that may not exist on every host.
   `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`.
   The NVIDIA variant uses `runtime: nvidia` (see [Troubleshooting](#troubleshooting)).
 - **AMD**: a ROCm-capable kernel driver (`amdgpu`), plus membership/access to
-  the `video` and `render` groups on the host. The service passes `/dev/kfd`
-  and `/dev/dri` through and sets `shm_size: 8g`. The AMD image is built locally
-  on first use (see [AMD / ROCm](#amd--rocm-rocm-72-derivative)).
+  the `video` and `render` groups on the host. The services pass `/dev/kfd`
+  and `/dev/dri` through and set `shm_size: 8g`. InvokeAI's AMD image is built
+  locally on first use (see [AMD / ROCm](#amd--rocm-rocm-72-derivative));
+  ComfyUI's AMD image is pulled from GHCR.
+- **ComfyUI**: pulled from a third-party image (there is no official one; see
+  [ComfyUI](#comfyui)). The GPU layers are large, so the first pull is slow.
 - A running reverse-proxy cluster that created the `web-proxy` network and
   serves `BASE_DOMAIN`.
 
@@ -87,7 +96,8 @@ declares its **complete** downstream contract:
 - `ACME_HOST` — the publicly-trusted certificate opt-in (internet-facing).
 - `GEN_SELF_SIGNED_CERT` — the self-signed opt-in (LAN/local testing),
   defaulting to `false` and overridable per service via
-  `INVOKEAI_GEN_SELF_SIGNED_CERT` / `BRIDGE_GEN_SELF_SIGNED_CERT`.
+  `INVOKEAI_GEN_SELF_SIGNED_CERT` / `COMFYUI_GEN_SELF_SIGNED_CERT` /
+  `BRIDGE_GEN_SELF_SIGNED_CERT`.
 
 Because both opt-ins are declared, the same compose file works in either proxy
 variant; the proxy honours only the one that matches. **Start the proxy cluster
@@ -96,57 +106,81 @@ first** — its network is consumed as `external: true` here.
 Hostnames are defined once in `x-hosts`:
 
 - InvokeAI → `invokeai.${BASE_DOMAIN}`
+- ComfyUI → `comfyui.${BASE_DOMAIN}`
 - Bridge → `images.${BASE_DOMAIN}`
 
 ## Model storage
 
-InvokeAI owns its models on a dedicated named volume, `invokeai-models`, mounted
-at `/models` and configured with `INVOKEAI_MODELS_DIR=/models`. Keeping it
-outside `INVOKEAI_ROOT` means the upstream entrypoint's recursive `chown` never
-walks the model store, and the pool can later be mounted read-only into ComfyUI.
-Because the entrypoint only chowns `INVOKEAI_ROOT`, a one-shot `invokeai-init`
-service chowns the top level of `invokeai-models` to `PUID`/`PGID` and creates
-the persistent MIOpen cache directory before InvokeAI starts
-(`CONTAINER_UID=${PUID:-1000}` keeps the container's runtime user aligned).
+There are two independent stores; `ai-models` is the shared canonical tree.
 
-- Models downloaded in the InvokeAI UI land in `invokeai-models` (one `<uuid>/`
-  folder per model, tracked by InvokeAI's database).
-- `ai-models` is a separate, ComfyUI-canonical volume seeded by `models-init`
-  (`checkpoints`, `loras`, `vae`, ...). InvokeAI does **not** use it.
-- To share bytes with the future ComfyUI, mount `invokeai-models` read-only into
-  ComfyUI and list it in `extra_model_paths.yaml`. Do **not** point InvokeAI's
-  `models_dir` at the ComfyUI tree: InvokeAI rewrites its managed dir (flat
-  `<uuid>` layout) and `Sync Models` can recursively delete orphan folders.
+- **`ai-models`** — ComfyUI's canonical store, seeded by `models-init`
+  (`checkpoints`, `loras`, `vae`, ...) and mounted at `/comfyui/models` in both
+  ComfyUI variants. It is the **shared byte source**: download models here (or
+  export them from InvokeAI) and add them to InvokeAI as **external** models by
+  absolute path (InvokeAI "Add Model" → scan folder). Bulk-load with the
+  one-off container below.
+- **`invokeai-models`** — InvokeAI's managed store, mounted at `/models` with
+  `INVOKEAI_MODELS_DIR=/models`. Since InvokeAI 6.9 it is a flat `<uuid>/`
+  layout (`<uuid>/model.safetensors`) tracked in InvokeAI's database, so ComfyUI
+  **cannot** consume it directly: there are no `checkpoints/`, `vae/`, ...
+  type subdirectories to map in `extra_model_paths.yaml`, and the filenames are
+  opaque. Do **not** mount it into ComfyUI. Conversely, never point InvokeAI's
+  `models_dir` at the ComfyUI tree: InvokeAI rewrites its managed dir and
+  `Sync Models` can recursively delete orphan folders.
+
+`invokeai-init` chowns the top level of `invokeai-models` to `PUID`/`PGID`
+(`invokeai-root` stays outside the store, so the upstream entrypoint's recursive
+chown never walks it) and creates InvokeAI's persistent MIOpen cache directory;
+`comfyui-init` creates ComfyUI's MIOpen cache directory. The InvokeAI images run
+as `PUID` (`CONTAINER_UID=${PUID:-1000}` keeps them aligned); the ComfyUI images
+run as root, so only InvokeAI's store needs the ownership fix.
 
 Bulk-load ComfyUI-style models into `ai-models` with a one-off container:
 
 ```sh
-docker run --rm -v local-image-ai_ai-models:/models -v "$PWD":/src alpine:3.22 \
+docker run --rm -v image-ai_ai-models:/models -v "$PWD":/src alpine:3.22 \
   cp /src/my-model.safetensors /models/checkpoints/
 ```
 
 (If the project directory is renamed, the volume prefix changes; check
 `docker volume ls | grep ai-models`.)
 
-## Adding ComfyUI later
+## ComfyUI
 
-The project is structured for it:
+ComfyUI runs as a `comfyui-nvidia` / `comfyui-amd` pair under the same
+`nvidia` / `amd` profiles as InvokeAI, sharing one `x-comfyui-common` anchor,
+the internal alias `comfyui`, and the hostname `comfyui.${BASE_DOMAIN}`.
 
-1. Add a `comfyui` service pair (`comfyui-nvidia`, `comfyui-amd`) using the
-   same `nvidia` / `amd` profile pattern and a shared `x-comfyui-common` anchor.
-2. Mount `ai-models` at `/comfyui/models` for ComfyUI's own downloads, and
-   mount `invokeai-models` read-only (e.g. `/invoke-models:ro`) as an
-   `extra_model_paths.yaml` source so InvokeAI's models are visible without
-   duplication.
-3. Give it the internal-network alias `comfyui` and the hostname
-   `comfyui.${BASE_DOMAIN}` via the `x-hosts` anchor, with the same full proxy
-   contract (no `ports:`).
-4. Record the change in `CHANGELOG.md` and `env.example`.
+ComfyUI has **no official image**, so both variants use the same maintained
+community family
+([`radiatingreverberations/comfyui-docker`](https://github.com/radiatingreverberations/comfyui-docker),
+image `ghcr.io/radiatingreverberations/comfyui-extensions`):
+
+- `--profile nvidia` → `COMFYUI_IMAGE_CUDA` (CUDA 13.0.3).
+- `--profile amd` → `COMFYUI_IMAGE_ROCM` (ROCm 7.2.3 + PyTorch 2.11.0 — the
+  same ROCm line as the InvokeAI AMD derivative, required on gfx1151 / Strix
+  Halo).
+
+The image runs as root and already serves `0.0.0.0:8188`; the service exposes
+that port and adds the full proxy contract. Persistent named volumes:
+`ai-models` (`/comfyui/models`), `comfyui-nodes` (`custom_nodes`),
+`comfyui-user`, `comfyui-input`, `comfyui-output`, and `comfyui-cache`
+(`/root/.cache`, holding the persistent MIOpen find-db created by
+`comfyui-init`).
+
+Tags are moving (`latest` / `amd-latest`); pin a `vX.Y.Z` / `amd-vX.Y.Z` tag or
+an image digest in `.env` for reproducible deployments. To use a different
+image family (e.g. `yanwk/comfyui-boot`, the most popular), only the `image:`
+values and the container paths change — the profiles, volumes and proxy contract
+stay the same.
+
+Drag-drop workflows and per-use-case node guides live in
+[`WORKFLOWS.md`](WORKFLOWS.md) — start with basic image generation.
 
 ## Operational notes
 
-- `restart: unless-stopped` everywhere except the one-shot `models-init` and
-  `invokeai-init` (`restart: "no"`).
+- `restart: unless-stopped` everywhere except the one-shot `models-init`,
+  `invokeai-init` and `comfyui-init` (`restart: "no"`).
 - No `container_name:` — Compose default naming keeps services scalable.
 - Config changes to the bridge data dir do not apply to an existing
   `bridge-data` volume; remove service + volume to reseed (see
@@ -160,7 +194,11 @@ The project is structured for it:
   [Workflow templates](openai-bridge/README.md#workflow-templates).
 - Stamp builds with a date if you want a traceable image:
   `BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) docker compose build`.
-- Homepage labels are set on both long-running services.
+- The ComfyUI images run as root, so their data volumes
+  (`comfyui-nodes`, `comfyui-user`, `comfyui-input`, `comfyui-output`,
+  `comfyui-cache`) are root-owned; to reset one, remove the service's volume and
+  `up -d` again.
+- Homepage labels are set on all long-running services.
 
 ## Troubleshooting
 

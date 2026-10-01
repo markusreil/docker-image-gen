@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WORKFLOWS.md`: top-level ComfyUI workflows section with per-use-case
+  guides, starting with general basic image generation (nodes and settings).
+- `comfyui-workflows/`: drag-drop ComfyUI workflows for the same-face /
+  different-body fashion set — `01-base-standard-body.json` (SDXL txt2img base,
+  832x1216), `02-variant-pulid-openpose.json` (PuLID identity + DWPose /
+  OpenPose ControlNet variant), and `03-variant-base-plus-addons.json`
+  (shared base prompt + 3 pose addons via ConditioningCombine, same seed for a
+  related series).
+- `comfyui-workflows/01-base-standard-body_api.json`: Dev-mode API-format export
+  of the base workflow for remote `/prompt` use (patch nodes `3`/`4` for
+  positive/negative, poll `/history`, fetch via `/view`).
+- `scripts/fetch-comfyui-models.sh`: idempotent helper that fetches the public
+  ComfyUI SDXL models for pose + identity work (xinsir OpenPose-SDXL ControlNet,
+  PuLID-SDXL adapter + antelopev2, FaceID Plus V2 trio + CLIP-ViT-H, ReActor
+  inswapper + detector) into the `ai-models` volume. Skips existing files,
+  supports `--dry-run` / `--force` / `--skip-*`; gated Civitai checkpoints
+  (Juggernaut XL, RealVisXL) are checked with manual-copy instructions.
+- ComfyUI support as a `comfyui-nvidia` (`nvidia` profile) / `comfyui-amd`
+  (`amd` profile) pair sharing `x-comfyui-common` + `x-comfyui-env`, the
+  internal alias `comfyui`, and the hostname `comfyui.${BASE_DOMAIN}` with the
+  full proxy contract. ComfyUI has no official image, so both variants use the
+  same maintained community family
+  (`ghcr.io/radiatingreverberations/comfyui-extensions`, CUDA 13.0.3 vs
+  `amd-*` ROCm 7.2.3 + PyTorch 2.11.0), keeping the shared container paths
+  identical.
+- `comfyui-init` one-shot service that creates ComfyUI's persistent MIOpen
+  find-db directory so the AMD variant does not recompile convolution kernels on
+  every boot, plus `comfyui-nodes`, `comfyui-user`, `comfyui-input`,
+  `comfyui-output` and `comfyui-cache` volumes for ComfyUI's persistent state.
+- `COMFYUI_IMAGE_CUDA`, `COMFYUI_IMAGE_ROCM` and
+  `COMFYUI_GEN_SELF_SIGNED_CERT` in `env.example` / `.env`.
+- `x-rocm-tuning` anchor shared by `invokeai-amd` and `comfyui-amd` for the
+  gfx1151 / Strix Halo ROCm variables (AOTriton, hipBLASLt, SDMA, MIOpen find
+  mode); only the MIOpen cache paths remain per-service.
 - `invokeai-rocm/Dockerfile`: a thin AMD/ROCm derivative of the upstream
   InvokeAI image that reinstalls torch/torchvision/torchaudio/triton-rocm from
   PyTorch's self-contained ROCm 7.2 wheels. The upstream `main-rocm` tag ships
@@ -48,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `comfyui-workflows/01-base-standard-body.json` (and its `_api.json` export) now
+  refine faces with Impact Pack `FaceDetailer` (`UltralyticsDetectorProvider`
+  `bbox/face_yolov8m.pt`, `20 steps, denoise 0.45, cfg 4.5`) after `VAEDecode`.
+  Requires `ComfyUI-Impact-Pack` + `ComfyUI-Impact-Subpack` in `comfyui-nodes`;
+  the detector weight is already fetched by `scripts/fetch-comfyui-models.sh`.
+
+- Project renamed `local-image-ai` -> `image-ai` (compose `name:`, built images, runtime volume prefix). Note old `local-image-ai_*` volumes are orphaned, not migrated.
+
+- `ai-models` is now consumed by ComfyUI at `/comfyui/models` as the shared
+  ComfyUI-canonical byte source; InvokeAI uses it only through external
+  (absolute-path) model imports. The `invokeai-models` volume is still
+  InvokeAI-only and is no longer documented as a ComfyUI path.
 - `invokeai-amd` now sets gfx1151 / APU tuning
   (`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` + `..._CACHE=1`,
   `TORCH_BLAS_PREFER_HIPBLASLT=1`, `HSA_ENABLE_SDMA=0`,
@@ -91,6 +137,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed the checkpoint name in `comfyui-workflows/01-base-standard-body.json`
+  and `02-variant-pulid-openpose.json` (`juggernautXL_runDiffusionPhoto_v8` ->
+  `juggernautXL_ragnarok`).
+- Corrected the documented model-sharing design: since InvokeAI 6.9 the
+  `invokeai-models` store is a flat `<uuid>/model.safetensors` layout tracked in
+  InvokeAI's database, so the previously-planned `extra_model_paths.yaml` share
+  into ComfyUI cannot work (there are no `checkpoints/`, `vae/`, ... type
+  subdirectories to map). ComfyUI now uses `ai-models` and InvokeAI imports from
+  it as external models.
 - Fixed InvokeAI failing to start with `PermissionError: [Errno 13] Permission
   denied: '/models/model_images'`: the upstream entrypoint only chowns
   `INVOKEAI_ROOT` before dropping privileges, so the `invokeai-models` volume
